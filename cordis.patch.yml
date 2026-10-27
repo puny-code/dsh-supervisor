@@ -151,8 +151,8 @@
       name: '@deepseek-ai/dsh-agent-preset'
       config:
         id: guantian
-        name: 观天
-        description: 天监的干净眼睛：一次性只读审查，不写代码不改文件，批完即走
+        name: 观天 · 天监专用
+        description: 天监深审内部调用（干净上下文一次性审查），请勿手动选择；日常开发请用“御天司监”
         order: 21
         plugins:
           - id: persona
