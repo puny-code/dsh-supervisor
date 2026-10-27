@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "天监",
+    "description": "DeepSeek Harness 的监督者插件。当前只开出一个空的 supervisor 工具作为固定入口，会话监察、计划审阅与约束执行等能力将逐步加入。"
+  }
+}

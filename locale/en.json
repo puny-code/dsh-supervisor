@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Tianjian Supervisor",
+    "description": "A supervisor surface for DeepSeek Harness. It currently exposes one inert `supervisor` tool as a stable entry point; session oversight, plan review, and constraint enforcement are being added step by step."
+  }
+}

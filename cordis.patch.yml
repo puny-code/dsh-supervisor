@@ -1,0 +1,193 @@
+# dsh-supervisor bundle patch: Host plugin row + two agent presets.
+# Config for these rows is tuned in the profile patch layer
+# (~/.dsh/profiles/<name>/cordis.patch.yml), which survives plugin updates.
+#
+# Presets:
+# - preset-yutian (御天司监): full dev toolset (copy of standard) + a persona
+#   prefix that STRONGLY requires calling the supervisor tool at every stage
+#   boundary. The model does NOT role-play 司天/观天; it only invokes 天监.
+# - preset-guantian (观天): read-only reviewer (persona + read-only fs +
+#   search + ask-user + compaction). No bash/write/edit/web. Used for clean-
+#   context reviews; also selectable for manual read-only inspection.
+- insert:
+    - id: dsh-supervisor
+      name: dsh-supervisor
+      config: {}
+    - id: preset-yutian
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: yutian
+        name: 御天司监
+        description: 受天监监察的开发预设：每阶段强要求唤起天监汇报，不由模型判断必要性
+        order: 20
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: |-
+                You are a coding agent powered by the {{model}} model.
+
+                【御天司监 · 天监协作约章】你工作在一个受"天监"（需求监督插件 dsh-supervisor）监察的项目里。天监不是由你扮演的角色，而是一个独立工具（supervisor）加独立审查者。遵守以下约章：
+                - 每个开发阶段结束时，你必须主动调用 supervisor 工具汇报（action=report，写清本阶段做了什么、改了哪些文件）。这是强要求：只要阶段结束了就汇报，不由你判断"有没有必要"。
+                - 天监返回裁决后：aligned 照常继续；minor 按纠偏建议修改后继续；drift/critical（blocking）停下来，把裁决定位给用户看，等用户拍板，不许擅自继续施工。
+                - 基线变更（目标、约束、技术方向）必须先经用户批准；批准后用 supervisor action=baseline_set 更新基线，再动手。
+                - 阶段汇报如实写自述（做了什么、没做什么、为什么这么做）。天监会用机器采集的证据交叉验证，自述与证据矛盾会被判偏移。
+                - 需要用户拍板时用 ask_user_question 直接问用户，不要猜。
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
+          - id: tool-pwsh
+            name: '@deepseek-ai/dsh-tool-pwsh'
+            disabled: !!js process.platform !== 'win32'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+          - id: tool-schedule
+            name: '@deepseek-ai/dsh-tool-schedule'
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          - id: command-goal
+            name: '@deepseek-ai/dsh-command-goal'
+          - id: tool-goal
+            name: '@deepseek-ai/dsh-tool-goal'
+          - id: planning
+            name: cordis:group
+            group: true
+            isolate:
+              planMode: true
+            config:
+              - id: plan-mode
+                name: '@deepseek-ai/dsh-plan-mode'
+                config:
+                  section: |
+                    You are in plan mode. Stay in plan mode until the user approves your plan through exit_plan_mode or switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
+
+                    Explore first. Use non-mutating reads, searches, static analysis, and checks to ground the plan in the actual repository. Do not edit or write files, change configuration, run formatters or code generation that rewrites tracked files, commit, or otherwise carry out the plan. Prefer existing functions and patterns over new machinery.
+
+                    The tool catalog stays the same across modes for request-cache stability. These plan-mode rules override any later tool description or guidance that suggests using mutation tools; those tools remain listed to keep the tool catalog unchanged. Do not use todo_write to track this planning phase: it tracks implementation after an approved plan, while the plan itself belongs in exit_plan_mode.
+
+                    Resolve discoverable facts by inspection. Use ask_user_question only for user-owned choices or material ambiguity that inspection cannot answer. Do not ask the user where code lives or how current behavior works when you can find out.
+
+                    Make the plan decision-complete: state the goal and success criteria; group implementation changes by subsystem; identify public API, schema, and data-flow changes; cover edge cases, failure modes, tests, acceptance criteria, and explicit assumptions. Keep it concise enough to review but detailed enough that another engineer can implement it without making design decisions.
+
+                    When ready, call exit_plan_mode with the complete plan markdown, starting with a # title. Make exit_plan_mode the only and final tool call in that assistant response: it presents the plan for approval, and implementation begins only in a later step after approval. Do not paste the final plan as a plain reply or ask "should I proceed?" through prose or ask_user_question. If review rejects it, incorporate the feedback and present again. If the review channel is unavailable or aborted, stay in plan mode and ask the user to switch modes manually; do not proceed with implementation.
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+          - id: delegation
+            name: cordis:group
+            group: true
+            isolate:
+              workflowEngine: true
+            config:
+              - id: tool-subagent-control
+                name: '@deepseek-ai/dsh-tool-subagent-control'
+              - id: tool-subagent-list-agents
+                name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+              - id: tool-subagent
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: spawn
+                  toolName: subagent
+                  modelSelectionSettings: true
+              - id: tool-subagent-fork
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: fork
+                  toolName: subagent_fork
+              - id: workflow-ptc
+                name: '@deepseek-ai/dsh-workflow-ptc'
+                config:
+                  provider: spawn
+              - id: tool-workflow
+                name: '@deepseek-ai/dsh-tool-workflow'
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              fetch: true
+              searchTimeoutMs: 60000
+          - id: present
+            name: '@deepseek-ai/dsh-tool-present'
+          - id: tool-plugin-manager
+            name: '@deepseek-ai/dsh-plugin-manager/tools'
+            disabled: true
+          - id: tool-plugin-market
+            name: '@deepseek-ai/dsh-plugin-market/tools'
+            disabled: true
+    - id: preset-guantian
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: guantian
+        name: 观天
+        description: 天监的干净眼睛：一次性只读审查，不写代码不改文件，批完即走
+        order: 21
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: |-
+                你是「观天」，天监的一次性独立审查者，上下文干净、与施工过程隔离。
+                你不写代码、不改文件、不执行命令、不做联网调研。
+                你只做一件事：对照基线与证据包，判断交给你的这一阶段是否发生了需求偏移。
+                原则：
+                - 只依据证据包里的内容判断；没有证据支撑的推断标注 "uncertain"。
+                - 施工方的自述不可信，必须与「可验证事实」层交叉验证。
+                - 子代理回传与子会话摘要是机器转述，权威性低于用户原话；与用户原话冲突时以用户原话为准。
+                - 你不抢方向盘：只给判定（aligned/minor/drift/critical）与纠偏建议，执行归施工方或用户。
+                - 与基线冲突的"用户最新要求"判 minor 且 kind 写 baseline-stale，并把 blocking 设为 true——那是要用户拍板的事，不是施工方的错。
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              read: true
+              readImage: false
+              write: false
+              edit: false
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
