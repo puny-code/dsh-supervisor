@@ -20,7 +20,7 @@
   var PANEL_ID = 'dsh-supervisor'
   var VIEW_ID = 'supervisor'
   var POLL_MS = 12000
-  var CLIENT_BUILD = 'v1.5.2'
+  var CLIENT_BUILD = 'v1.6.1'
 
   var React = null
   try {
@@ -3280,8 +3280,11 @@
 
     var criticalLimit = limitOf(settings.criticalLimit, 3)
     var streakLimit = limitOf(settings.driftStreakLimit, 2)
-    var criticalCount = counters && Number.isFinite(Number(counters.criticalCount)) ? Number(counters.criticalCount) : 0
-    var streakCount = counters && Number.isFinite(Number(counters.driftStreak)) ? Number(counters.driftStreak) : 0
+    // Session-scoped: 谁的会话偏了记谁的账，打断只看本会话。项目累计另见
+    // data.workspaceCounters（独立页用那套）。
+    var sessCounters = (data && data.sessionCounters) || counters
+    var criticalCount = sessCounters && Number.isFinite(Number(sessCounters.criticalCount)) ? Number(sessCounters.criticalCount) : 0
+    var streakCount = sessCounters && Number.isFinite(Number(sessCounters.driftStreak)) ? Number(sessCounters.driftStreak) : 0
     var machineFiles = evidence && Number.isFinite(Number(evidence.files)) ? Number(evidence.files) : null
     var matchedFiles = machineFiles === null || !stage ? null : touched.length === machineFiles
     var interrupting = settings.interruptEnabled === true
@@ -3403,20 +3406,20 @@
       }),
       React.createElement(TabTapeCell, {
         label: '审查次数',
-        value: counters ? num(counters.reviewCount) : '—',
-        hint: counters ? '同项目累计 · 最近 ' + shortTime(counters.lastReviewAt) : '同项目累计',
+        value: sessCounters ? num(sessCounters.reviewCount) : '—',
+        hint: sessCounters ? '本会话累计 · 最近 ' + shortTime(sessCounters.lastReviewAt) : '本会话累计',
       }),
       React.createElement(TabTapeCell, {
         label: '严重偏移',
         value: num(criticalCount) + ' / ' + num(criticalLimit),
         tone: criticalCount >= criticalLimit ? T.bad : T.text,
-        hint: criticalCount >= criticalLimit ? '已达打断阈值 · 同项目累计' : '阈值 ' + num(criticalLimit) + ' 次 · 同项目累计',
+        hint: criticalCount >= criticalLimit ? '已达打断阈值 · 本会话' : '阈值 ' + num(criticalLimit) + ' 次 · 本会话',
       }),
       React.createElement(TabTapeCell, {
         label: '连续偏移',
         value: num(streakCount) + ' / ' + num(streakLimit),
         tone: streakCount >= streakLimit ? T.warn : T.text,
-        hint: streakCount >= streakLimit ? '已达打断阈值 · 同项目累计' : '阈值 ' + num(streakLimit) + ' 轮 · 同项目累计',
+        hint: streakCount >= streakLimit ? '已达打断阈值 · 本会话' : '阈值 ' + num(streakLimit) + ' 轮 · 本会话',
       }),
       React.createElement(TabTapeCell, {
         label: '基线',
@@ -3929,7 +3932,7 @@
       React.createElement(
         'p',
         { style: TAB_UI.tapeNote },
-        '口径：审查次数、严重偏移、连续偏移按项目（工作区）累计，不是单会话计数；阶段与证据只属本会话。',
+        '口径：审查次数、严重偏移、连续偏移按本会话累计（打断只看本会话）；阶段与证据只属本会话。项目累计见独立页。',
       ),
       data ? main : null,
       data ? band : null,

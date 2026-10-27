@@ -1,0 +1,3 @@
+*.tgz
+SHA256SUMS.txt
+node_modules/

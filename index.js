@@ -180,7 +180,7 @@ const JOURNAL_ENTRY = schema({
   hash: F.str(),
 })
 
-const COUNTERS = schema({
+const COUNTER_SHAPE = {
   lastReviewAt: F.str(''),
   reviewCount: F.int(0),
   criticalCount: F.int(0),
@@ -190,7 +190,9 @@ const COUNTERS = schema({
   lastInterruptAt: F.str(''),
   pendingNotice: F.any(null),
   lastAck: F.any(null),
-})
+}
+
+const COUNTERS = schema(COUNTER_SHAPE)
 
 const DEFAULT_COUNTERS = {
   lastReviewAt: '',
@@ -203,6 +205,17 @@ const DEFAULT_COUNTERS = {
   pendingNotice: null,
   lastAck: null,
 }
+
+/**
+ * Session-scoped counters. 严重偏移 / 连续偏移是会话级的：谁的会话偏了，
+ * 就记在谁的账上、打断谁——A 会话的烂账不再记到 B 会话头上。
+ * Per-record layout: a new table needs no domain version bump.
+ */
+const SESSION_COUNTERS = schema({
+  workspaceId: F.str(''),
+  sessionId: F.str(''),
+  ...COUNTER_SHAPE,
+})
 
 const SESSION_BASELINE = schema({
   scope: F.enumOf(['session'], 'session'),
@@ -276,6 +289,7 @@ const WORKSPACES_SPEC = {
   invalidRecords: 'backup-and-skip',
   tables: {
     counters: { valueSchema: COUNTERS },
+    session_counters: { valueSchema: SESSION_COUNTERS },
     session_baselines: { valueSchema: SESSION_BASELINE },
     transcripts: { valueSchema: TRANSCRIPT },
   },
@@ -1128,11 +1142,57 @@ async function storage(ctx) {
 // so anything that must not leak across projects lives in `supervisor_workspaces`).
 // ---------------------------------------------------------------------------
 
-async function countersOf(ctx, workspaceId) {
+/** Storage key for one session's counters. Wash both halves so the joiner '__' is unambiguous. */
+function sessionCounterKey(workspaceId, sessionId) {
+  const clean = (s) => String(s || '').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120) || 'unknown'
+  return `${clean(workspaceId)}__${clean(sessionId)}`
+}
+
+async function countersOf(ctx, workspaceId, sessionId) {
   const { workspaces, domain } = await storage(ctx)
   if (!workspaces) return { ...DEFAULT_COUNTERS }
+  const ws = String(workspaceId || '')
+  if (sessionId) {
+    // Session-scoped: this session's own streaks. Seed once from the legacy
+    // workspace row (clocks + unseen notice carry over) but never the streaks.
+    const sid = String(sessionId)
+    try {
+      const table = workspaces.table('session_counters')
+      const key = sessionCounterKey(ws, sid)
+      const hit = table.get(key)
+      if (hit) return SESSION_COUNTERS.parse(hit)
+      const seeded = { ...DEFAULT_COUNTERS, workspaceId: ws, sessionId: sid }
+      try {
+        const legacy = workspaces.table('counters').get(ws)
+        if (legacy) {
+          const old = COUNTERS.parse(legacy)
+          seeded.pendingNotice = old.pendingNotice || null
+          seeded.lastReviewAt = old.lastReviewAt || ''
+          seeded.lastStageSeq = old.lastStageSeq || 0
+          seeded.lastAutoReviewAt = old.lastAutoReviewAt || ''
+          seeded.lastInterruptAt = old.lastInterruptAt || ''
+          seeded.lastAck = old.lastAck || null
+          // Move the notice: it now lives on this session's row.
+          if (old.pendingNotice) {
+            await workspaces.table('counters').put(ws, { ...old, pendingNotice: null })
+          }
+        }
+      } catch {
+        /* seed clean */
+      }
+      const row = SESSION_COUNTERS.parse(seeded)
+      try {
+        await table.put(key, row)
+      } catch {
+        /* read-through is best-effort */
+      }
+      return row
+    } catch {
+      return { ...DEFAULT_COUNTERS }
+    }
+  }
   try {
-    const record = workspaces.table('counters').get(String(workspaceId || ''))
+    const record = workspaces.table('counters').get(ws)
     if (record) return COUNTERS.parse(record)
     // No row yet: derive from this workspace's own review history instead of
     // borrowing another project's streak.
@@ -1158,15 +1218,88 @@ async function countersOf(ctx, workspaceId) {
   }
 }
 
-async function saveCounters(ctx, workspaceId, next) {
+async function saveCounters(ctx, workspaceId, next, sessionId) {
   const { workspaces } = await storage(ctx)
   if (!workspaces) return false
+  const ws = String(workspaceId || '')
   try {
-    await workspaces.table('counters').put(String(workspaceId || ''), COUNTERS.parse(next))
+    if (sessionId) {
+      const row = SESSION_COUNTERS.parse({
+        ...next,
+        workspaceId: ws,
+        sessionId: String(sessionId),
+      })
+      await workspaces.table('session_counters').put(sessionCounterKey(ws, sessionId), row)
+      return true
+    }
+    await workspaces.table('counters').put(ws, COUNTERS.parse(next))
     return true
   } catch {
     return false
   }
+}
+
+/**
+ * Project-level rollup: sums session rows of one workspace. Display-only —
+ * decisions (blocking, interrupt) always read the session row via countersOf.
+ * Workspaces that never migrated still contribute their legacy row.
+ */
+async function workspaceCountersOf(ctx, workspaceId) {
+  const { workspaces } = await storage(ctx)
+  const total = { ...DEFAULT_COUNTERS }
+  if (!workspaces) return total
+  const ws = String(workspaceId || '')
+  let bestNoticeAt = ''
+  let sawSession = false
+  try {
+    for (const [, record] of workspaces.table('session_counters').entries()) {
+      if (!record || record.workspaceId !== ws) continue
+      let c
+      try {
+        c = SESSION_COUNTERS.parse(record)
+      } catch {
+        continue
+      }
+      sawSession = true
+      total.reviewCount += c.reviewCount || 0
+      total.criticalCount += c.criticalCount || 0
+      if ((c.driftStreak || 0) > (total.driftStreak || 0)) total.driftStreak = c.driftStreak || 0
+      if (c.lastReviewAt && c.lastReviewAt > total.lastReviewAt) total.lastReviewAt = c.lastReviewAt
+      if (c.lastAutoReviewAt && c.lastAutoReviewAt > total.lastAutoReviewAt) total.lastAutoReviewAt = c.lastAutoReviewAt
+      if (c.lastInterruptAt && c.lastInterruptAt > (total.lastInterruptAt || '')) total.lastInterruptAt = c.lastInterruptAt
+      if ((c.lastStageSeq || 0) > (total.lastStageSeq || 0)) total.lastStageSeq = c.lastStageSeq || 0
+      if (c.pendingNotice && (c.lastReviewAt || '') >= bestNoticeAt) {
+        bestNoticeAt = c.lastReviewAt || ''
+        total.pendingNotice = c.pendingNotice
+      }
+    }
+  } catch {
+    /* a broken row must not blank the panel */
+  }
+  // Pre-migration history lives only in the legacy workspace row, which is
+  // frozen once sessions start writing their own rows — its counts still add
+  // up, but its streak must not resurrect after sessions reset their own.
+  try {
+    const legacy = workspaces.table('counters').get(ws)
+    if (legacy) {
+      const old = COUNTERS.parse(legacy)
+      total.reviewCount += old.reviewCount || 0
+      total.criticalCount += old.criticalCount || 0
+      if (!sawSession) {
+        if ((old.driftStreak || 0) > (total.driftStreak || 0)) total.driftStreak = old.driftStreak || 0
+        if (old.pendingNotice && (old.lastReviewAt || '') >= bestNoticeAt) {
+          total.pendingNotice = old.pendingNotice
+        }
+      }
+      if (old.lastReviewAt && old.lastReviewAt > total.lastReviewAt) total.lastReviewAt = old.lastReviewAt
+      if (old.lastAutoReviewAt && old.lastAutoReviewAt > total.lastAutoReviewAt) total.lastAutoReviewAt = old.lastAutoReviewAt
+      if (old.lastInterruptAt && old.lastInterruptAt > (total.lastInterruptAt || '')) total.lastInterruptAt = old.lastInterruptAt
+      if ((old.lastStageSeq || 0) > (total.lastStageSeq || 0)) total.lastStageSeq = old.lastStageSeq || 0
+    }
+  } catch {
+    /* fall through with whatever accumulated */
+  }
+  return total
 }
 
 async function sessionBaselineOf(ctx, sessionId) {
@@ -1199,23 +1332,49 @@ function mergeBaselines(project, session) {
 }
 
 async function aggregateCounters(ctx) {
-  const { workspaces } = await storage(ctx)
+  const { workspaces, domain } = await storage(ctx)
   const total = { ...DEFAULT_COUNTERS, workspaces: 0, pendingNotices: [], maxDriftStreak: 0 }
   if (!workspaces) return total
-  try {
-    for (const [key, record] of workspaces.table('counters').entries()) {
-      if (!record) continue
-      const c = COUNTERS.parse(record)
-      total.workspaces += 1
-      total.reviewCount += c.reviewCount
-      total.criticalCount += c.criticalCount
-      if ((c.driftStreak || 0) > total.maxDriftStreak) total.maxDriftStreak = c.driftStreak || 0
-      if (c.lastReviewAt && c.lastReviewAt > total.lastReviewAt) total.lastReviewAt = c.lastReviewAt
-      if (c.lastInterruptAt && c.lastInterruptAt > (total.lastInterruptAt || '')) total.lastInterruptAt = c.lastInterruptAt
-      if (c.pendingNotice) total.pendingNotices.push({ workspaceId: key, ...c.pendingNotice })
+  // Discover workspaces from every table that carries a workspaceId, so a
+  // project shows up even before its first session row exists.
+  const ids = new Set()
+  const collect = (tableName, keyFn) => {
+    try {
+      for (const [key, record] of workspaces.table(tableName).entries()) {
+        if (!record) continue
+        const id = keyFn(key, record)
+        if (id) ids.add(id)
+      }
+    } catch {
+      /* a broken table must not blank the panel */
     }
-  } catch {
-    /* a broken counter row must not blank the whole panel */
+  }
+  collect('session_counters', (key, record) => record.workspaceId || null)
+  collect('counters', (key) => key || null)
+  collect('session_baselines', (key, record) => record.workspaceId || key || null)
+  if (domain) {
+    try {
+      for (const [, record] of domain.table('baselines').entries()) {
+        if (record && record.workspaceId) ids.add(record.workspaceId)
+      }
+    } catch {
+      /* baselines enrich, they do not gate */
+    }
+  }
+  for (const id of ids) {
+    let c
+    try {
+      c = await workspaceCountersOf(ctx, id)
+    } catch {
+      continue
+    }
+    total.workspaces += 1
+    total.reviewCount += c.reviewCount
+    total.criticalCount += c.criticalCount
+    if ((c.driftStreak || 0) > total.maxDriftStreak) total.maxDriftStreak = c.driftStreak || 0
+    if (c.lastReviewAt && c.lastReviewAt > total.lastReviewAt) total.lastReviewAt = c.lastReviewAt
+    if (c.lastInterruptAt && c.lastInterruptAt > (total.lastInterruptAt || '')) total.lastInterruptAt = c.lastInterruptAt
+    if (c.pendingNotice) total.pendingNotices.push({ workspaceId: id, ...c.pendingNotice })
   }
   total.pendingNotice = total.pendingNotices[0] || null
   return total
@@ -1226,6 +1385,23 @@ async function clearNotices(ctx, workspaceId) {
   if (!workspaces) return false
   const only = typeof workspaceId === 'string' && workspaceId ? workspaceId : ''
   let cleared = false
+  try {
+    for (const [key, record] of workspaces.table('session_counters').entries()) {
+      if (!record || !record.pendingNotice) continue
+      if (only && record.workspaceId !== only) continue
+      const c = SESSION_COUNTERS.parse(record)
+      await workspaces.table('session_counters').put(key, {
+        ...c,
+        pendingNotice: null,
+        lastAck: { at: now(), via: 'ui' },
+      })
+      cleared = true
+    }
+  } catch {
+    return cleared
+  }
+  // Legacy workspace rows (pre-session-counters): clear them too so a notice
+  // parked before the migration does not stick around forever.
   try {
     for (const [key, record] of workspaces.table('counters').entries()) {
       if (only && key !== only) continue
@@ -1301,14 +1477,19 @@ async function actionStatus(ctx, exec) {
     }
   }
   const baseline = domain.table('baselines').get(workspaceId)
-  const counters = await countersOf(ctx, workspaceId)
+  const sessionId = exec && exec.agent ? exec.agent.id : ''
+  // Session row drives this session's decisions; the workspace rollup is
+  // display-only so the numbers stay comparable with the Tab.
+  const counters = await countersOf(ctx, workspaceId, sessionId)
+  const totals = await workspaceCountersOf(ctx, workspaceId)
   const lines = [
     `天监 v0.7 · 工作区 ${workspaceId}`,
     baseline
       ? `基线：第 ${baseline.revision} 版 · 意图「${baseline.intent || '未填写'}」· 目标 ${baseline.goals.length} 条 · 硬约束 ${baseline.constraints.hard.length} 条 · 软约束 ${baseline.constraints.soft.length} 条 · 方向 ${baseline.directions.length} 条`
       : '基线：尚未建立（需用户批准后调用 baseline_set）',
-    `审查次数：${counters.reviewCount}（严重 ${counters.criticalCount} · 连续偏移 ${counters.driftStreak}）`,
-    `最近审查：${counters.lastReviewAt || '无'}`,
+    `本会话审查 ${counters.reviewCount} 次（严重 ${counters.criticalCount} · 连续偏移 ${counters.driftStreak}）`,
+    `项目累计审查 ${totals.reviewCount} 次（严重 ${totals.criticalCount} · 最大连续偏移 ${totals.driftStreak}）`,
+    `最近审查：${counters.lastReviewAt || totals.lastReviewAt || '无'}`,
   ]
   if (counters.pendingNotice && counters.pendingNotice.message) {
     lines.unshift(
@@ -1319,7 +1500,7 @@ async function actionStatus(ctx, exec) {
   return {
     status: 'ok',
     message: lines.join('\n'),
-    data: { workspaceId, storage: 'ready', baseline: baseline ?? null, counters },
+    data: { workspaceId, storage: 'ready', baseline: baseline ?? null, counters, workspaceCounters: totals },
   }
 }
 
@@ -1328,10 +1509,16 @@ async function actionAck(ctx, exec) {
   const { domain, error } = await storage(ctx)
   if (!domain) return { status: 'degraded', message: `天监：存储不可用（${error}）。`, data: { cleared: false } }
   const workspaceId = workspaceIdOf(ctx, exec)
-  const counters = await countersOf(ctx, workspaceId)
-  if (!counters.pendingNotice) return { status: 'ok', message: '天监：没有待处理的提醒。', data: { cleared: false } }
+  const sessionId = exec && exec.agent ? exec.agent.id : ''
+  const counters = await countersOf(ctx, workspaceId, sessionId)
+  if (!counters.pendingNotice) {
+    // Be honest: another session of the same project may still hold one.
+    const totals = await workspaceCountersOf(ctx, workspaceId)
+    const extra = totals.pendingNotice ? '（本会话没有，但项目下其它会话还有 1 条待处理）' : ''
+    return { status: 'ok', message: `天监：本会话没有待处理的提醒。${extra}`, data: { cleared: false } }
+  }
   const was = counters.pendingNotice
-  await saveCounters(ctx, workspaceId, { ...counters, pendingNotice: null })
+  await saveCounters(ctx, workspaceId, { ...counters, pendingNotice: null }, sessionId)
   await appendJournal(domain, 'notice_acknowledged', { verdict: was.verdict || '', reviewId: was.reviewId || '' })
   return { status: 'ok', message: `天监：已清掉提醒（${was.message || was.verdict || '未注明'}）。`, data: { cleared: true } }
 }
@@ -1632,11 +1819,11 @@ async function actionReport(ctx, exec, args) {
       evidence,
     }),
   )
-  const counters = await countersOf(ctx, workspaceId)
+  const counters = await countersOf(ctx, workspaceId, sessionId)
   await saveCounters(ctx, workspaceId, {
     ...counters,
     lastStageSeq: Math.max(counters.lastStageSeq || 0, stageSeq),
-  })
+  }, sessionId)
   await appendJournal(domain, 'stage_reported', { workspaceId, stageSeq, reportId, reviewId })
   resetAccumulator(sessionId)
 
@@ -2924,7 +3111,7 @@ async function runLightReview(ctx, deps, opts = {}) {
     origin: 'review',
     evidence,
   })
-  const counters = opts.countersBase || (await countersOf(ctx, workspaceId))
+  const counters = opts.countersBase || (await countersOf(ctx, workspaceId, deps.sessionId))
   const stamp = now()
   const reviewId = shortId('rev')
   const updated = nextCounters(counters, parsed.verdict)
@@ -2952,7 +3139,7 @@ async function runLightReview(ctx, deps, opts = {}) {
     tokens: 0,
   })
   await domain.table('reviews').put(reviewId, review)
-  await saveCounters(ctx, workspaceId, blocking ? { ...updated, pendingNotice: noticeFor(review) } : updated)
+  await saveCounters(ctx, workspaceId, blocking ? { ...updated, pendingNotice: noticeFor(review) } : updated, deps.sessionId)
   // Keep 观天's raw reasoning next to its verdict so the Tab can show the whole pass.
   await saveTranscript(ctx, reviewId, {
     reviewId,
@@ -3471,7 +3658,7 @@ async function landDeepReview(ctx, deps, opts, src) {
     evidence,
   })
 
-  const base = opts.countersBase || (await countersOf(ctx, workspaceId))
+  const base = opts.countersBase || (await countersOf(ctx, workspaceId, deps.sessionId))
   const counters = nextCounters(base, parsed.verdict)
   const blocking =
     parsed.blocking || counters.criticalCount >= settings.criticalLimit || counters.driftStreak >= settings.driftStreakLimit
@@ -3499,7 +3686,7 @@ async function landDeepReview(ctx, deps, opts, src) {
     supersedes: opts.supersedes || '',
   })
   await domain.table('reviews').put(reviewId, review)
-  await saveCounters(ctx, workspaceId, { ...counters, ...(blocking ? { pendingNotice: noticeFor(review) } : {}) })
+  await saveCounters(ctx, workspaceId, { ...counters, ...(blocking ? { pendingNotice: noticeFor(review) } : {}) }, deps.sessionId)
   await saveTranscript(ctx, reviewId, {
     reviewId,
     sessionId: deps.sessionId || '',
@@ -3960,7 +4147,7 @@ async function runReview(ctx, deps) {  const sessionId = deps && deps.sessionId
 async function runReviewWork(ctx, deps) {
   const settings = settingsOf(deps.settingsDomain)
   if (!settings.enabled) return { ok: false, skipped: true, error: '审查已关闭（supervisor settings enabled=false）' }
-  const base = await countersOf(ctx, deps.workspaceId)
+  const base = await countersOf(ctx, deps.workspaceId, deps.sessionId)
   const engine = settings.engine || 'auto'
   // One shared digest for both passes: children are read once per review.
   try {
@@ -4026,7 +4213,7 @@ function startAutoReview(ctx) {
 
       const sessionId = picked.sessionId
       const workspaceId = workspaceIdForCwd(cwdOfSession(ctx, sessionId))
-      const counters = await countersOf(ctx, workspaceId)
+      const counters = await countersOf(ctx, workspaceId, sessionId)
       if (quietFor(counters.lastReviewAt) < settings.autoReviewMinutes * 60000) return
       if (quietFor(counters.lastAutoReviewAt) < settings.autoReviewMinutes * 60000) return
       const baseline = domain.table('baselines').get(workspaceId) || null
@@ -4046,8 +4233,8 @@ function startAutoReview(ctx) {
         sessionModel: sessionModelOf(ctx, sessionId),
       })
       if (!outcome.ok) return
-      const after = await countersOf(ctx, workspaceId)
-      await saveCounters(ctx, workspaceId, { ...after, lastAutoReviewAt: now() })
+      const after = await countersOf(ctx, workspaceId, sessionId)
+      await saveCounters(ctx, workspaceId, { ...after, lastAutoReviewAt: now() }, sessionId)
       // The auto pass consumes the stage number, so it owns a report row too —
       // otherwise the next manual report reuses the same seq and the Tab's
       // "current stage" mixes two reviews. kind 'auto' is the trigger trail.
@@ -4123,7 +4310,7 @@ function attachInterrupt(ctx) {
       const settings = settingsOf(settingsDomain)
       if (!settings.interruptEnabled) return decision
       const workspaceId = workspaceIdForCwd(cwdOfSession(ctx, sessionId))
-      const counters = await countersOf(ctx, workspaceId)
+      const counters = await countersOf(ctx, workspaceId, sessionId)
       const dueCritical = (counters.criticalCount || 0) >= settings.criticalLimit
       const dueStreak = (counters.driftStreak || 0) >= settings.driftStreakLimit
       if (!dueCritical && !dueStreak) return decision
@@ -4142,7 +4329,7 @@ function attachInterrupt(ctx) {
           verdict: 'critical',
           message: `天监已按阈值打断本轮施工（${reason}）。请先查看审查结论，再决定是否继续。`,
         },
-      })
+      }, sessionId)
       try {
         await appendJournal(domain, 'interrupt_fired', {
           sessionId,
@@ -4577,7 +4764,10 @@ async function sessionStateOf(ctx, sessionId) {
   const reports = plain(stageReports(domain, 40)).filter(
     (report) => !sessionId || !report.sessionId || report.sessionId === sessionId,
   )
-  const counters = await countersOf(ctx, workspaceId)
+  const counters = await countersOf(ctx, workspaceId, sessionId)
+  // Workspace rollup for display: the Tab shows 本会话 numbers from `counters`
+  // and keeps project totals here so nothing that said 同项目累计 goes stale.
+  const workspaceCounters = await workspaceCountersOf(ctx, workspaceId)
   // P0/P1 surfaces: the user's own words and the cross-stage ledger, so the Tab
   // can answer "what did I actually ask for" without opening the review.
   let userTimeline = []
@@ -4647,6 +4837,14 @@ async function sessionStateOf(ctx, sessionId) {
           driftStreak: counters.driftStreak,
           lastReviewAt: counters.lastReviewAt,
           lastAutoReviewAt: counters.lastAutoReviewAt || '',
+        }
+      : null,
+    workspaceCounters: workspaceCounters
+      ? {
+          reviewCount: workspaceCounters.reviewCount,
+          criticalCount: workspaceCounters.criticalCount,
+          driftStreak: workspaceCounters.driftStreak,
+          lastReviewAt: workspaceCounters.lastReviewAt,
         }
       : null,
     evidence,
@@ -4747,8 +4945,33 @@ async function workspaceRows(ctx) {
     return rows.get(key)
   }
   try {
+    // Session rows roll up per workspace; legacy workspace rows only fill in
+    // projects that have no session row yet (pre-migration).
+    const seen = new Set()
+    for (const [, record] of workspaces.table('session_counters').entries()) {
+      if (!record || !record.workspaceId) continue
+      let c
+      try {
+        c = SESSION_COUNTERS.parse(record)
+      } catch {
+        continue
+      }
+      seen.add(c.workspaceId)
+      const row = ensure(c.workspaceId)
+      row.reviewCount += c.reviewCount || 0
+      row.criticalCount += c.criticalCount || 0
+      if ((c.driftStreak || 0) > (row.driftStreak || 0)) row.driftStreak = c.driftStreak || 0
+      if (c.lastReviewAt && c.lastReviewAt > (row.lastReviewAt || '')) row.lastReviewAt = c.lastReviewAt
+      if ((c.lastStageSeq || 0) > (row.lastStageSeq || 0)) row.lastStageSeq = c.lastStageSeq || 0
+      if (c.pendingNotice) {
+        if (!row.pendingNotice || (c.lastReviewAt || '') >= (row._noticeAt || '')) {
+          row._noticeAt = c.lastReviewAt || ''
+          row.pendingNotice = plain(c.pendingNotice)
+        }
+      }
+    }
     for (const [key, record] of workspaces.table('counters').entries()) {
-      if (!record) continue
+      if (!record || seen.has(key)) continue
       const counters = COUNTERS.parse(record)
       const row = ensure(key)
       row.reviewCount = counters.reviewCount
@@ -4798,7 +5021,7 @@ async function workspaceRows(ctx) {
     }
   }
   const list = Array.from(rows.values()).map((row) => {
-    const { _sessions, ...rest } = row
+    const { _sessions, _noticeAt, ...rest } = row
     return { ...rest, sessionCount: _sessions.size }
   })
   list.sort((a, b) => {
@@ -5554,4 +5777,9 @@ export const __internals = {
   readChildSession,
   summarizeChildren,
   renderChildEvent,
+  sessionCounterKey,
+  workspaceCountersOf,
+  countersOf,
+  saveCounters,
+  clearNotices,
 }
