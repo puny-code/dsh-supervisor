@@ -23,7 +23,7 @@ export const name = 'dsh-supervisor'
 export const inject = ['tools']
 
 /** Reported by `health` and the UI footer; keep in step with package.json. */
-const SUPERVISOR_VERSION = 'v1.4.4'
+const SUPERVISOR_VERSION = 'v1.4.7'
 
 // ---------------------------------------------------------------------------
 // Minimal structural validator (the only thing the storage domain needs from
@@ -1089,52 +1089,57 @@ function resetAccumulator(sessionId) {
 // Domain lifecycle (lazy + resilient: a storage failure never blocks work)
 // ---------------------------------------------------------------------------
 
+const retiredStorageContexts = new WeakSet()
 let domainPromise
+let storageHandles = {}
+let storageFacility
+let storageClosing = Promise.resolve()
 
 async function storage(ctx) {
+  if (retiredStorageContexts.has(ctx)) return { error: '天监已卸载', failures: {} }
   if (!domainPromise) {
-    domainPromise = (async () => {
-      const facility = ctx.get('storageDomain')
-      if (!facility) return { domain: undefined, settings: undefined, error: 'storageDomain 服务不可用' }
+    const handles = storageHandles
+    const closing = storageClosing
+    const attempt = (async () => {
+      await closing
       const failures = {}
-      try {
-        const domain = await facility.open(DOMAIN_SPEC)
-        const safeOpen = async (spec) => {
-          try {
-            return await facility.open(spec)
-          } catch (err) {
-            const message = String((err && err.message) || err)
-            // A previous plugin generation may still hold the domain (reload race):
-            // reuse it instead of degrading every feature to "unavailable".
-            if (message.includes('already open') && typeof facility.get === 'function') {
-              try {
-                const existing = facility.get(spec.name)
-                if (existing) return existing
-              } catch {
-                /* fall through to the recorded failure */
-              }
-            }
-            failures[spec.name] = message
-            return undefined
-          }
-        }
-        const settingsDomain = await safeOpen(SETTINGS_SPEC)
-        const sessionsDomain = await safeOpen(SESSIONS_SPEC)
-        const workspacesDomain = await safeOpen(WORKSPACES_SPEC)
-        return {
-          domain,
-          settings: settingsDomain,
-          sessions: sessionsDomain,
-          workspaces: workspacesDomain,
-          failures,
-          error: undefined,
-        }
-      } catch (err) {
-        return { domain: undefined, settings: undefined, failures, error: String((err && err.message) || err) }
+      let facility
+      try { facility = ctx.get('storageDomain') } catch (err) {
+        return { ...handles, failures, error: String((err && err.message) || err) }
       }
+      if (!facility) return { failures, error: 'storageDomain 服务不可用' }
+      if (storageFacility && storageFacility !== facility) {
+        await Promise.allSettled(Object.values(handles).map((handle) => Promise.resolve().then(() => handle.close())))
+        for (const key of Object.keys(handles)) delete handles[key]
+      }
+      storageFacility = facility
+      for (const [key, spec] of [['domain', DOMAIN_SPEC], ['settings', SETTINGS_SPEC], ['sessions', SESSIONS_SPEC], ['workspaces', WORKSPACES_SPEC]]) {
+        if (handles[key]) continue
+        try { handles[key] = await facility.open(spec) } catch (err) {
+          failures[spec.name] = String((err && err.message) || err)
+        }
+      }
+      return { ...handles, failures, error: failures[DOMAIN_SPEC.name] }
     })()
+    domainPromise = attempt
+    attempt.finally(() => { if (domainPromise === attempt) domainPromise = undefined }).catch(() => {})
   }
   return domainPromise
+}
+
+async function closeStorage() {
+  const pending = domainPromise
+  const handles = storageHandles
+  domainPromise = undefined
+  storageHandles = {}
+  storageFacility = undefined
+  const previous = storageClosing
+  storageClosing = (async () => {
+    await previous
+    if (pending) await pending.catch(() => {})
+    await Promise.allSettled(Object.values(handles).map((handle) => Promise.resolve().then(() => handle.close())))
+  })()
+  await storageClosing
 }
 
 // ---------------------------------------------------------------------------
@@ -1472,7 +1477,7 @@ async function actionStatus(ctx, exec) {
   if (!domain) {
     return {
       status: 'degraded',
-      message: `天监 v0.7：存储不可用（${error}）。基线无法保存，其它功能照常，请不要因此中断施工。`,
+      message: `天监 ${SUPERVISOR_VERSION}：存储不可用（${error}）。基线无法保存，其它功能照常，请不要因此中断施工。`,
       data: { workspaceId, storage: 'unavailable', baseline: null, counters: null },
     }
   }
@@ -1483,7 +1488,7 @@ async function actionStatus(ctx, exec) {
   const counters = await countersOf(ctx, workspaceId, sessionId)
   const totals = await workspaceCountersOf(ctx, workspaceId)
   const lines = [
-    `天监 v0.7 · 工作区 ${workspaceId}`,
+    `天监 ${SUPERVISOR_VERSION} · 工作区 ${workspaceId}`,
     baseline
       ? `基线：第 ${baseline.revision} 版 · 意图「${baseline.intent || '未填写'}」· 目标 ${baseline.goals.length} 条 · 硬约束 ${baseline.constraints.hard.length} 条 · 软约束 ${baseline.constraints.soft.length} 条 · 方向 ${baseline.directions.length} 条`
       : '基线：尚未建立（需用户批准后调用 baseline_set）',
@@ -5388,7 +5393,10 @@ function attachRpc(ctx) {
 function attachRpcHttp(ctx) {
   try {
     const connection = ctx.get('connection')
-    if (!connection || !connection.fetch || typeof connection.fetch.register !== 'function') return () => {}
+    if (!connection || !connection.fetch || typeof connection.fetch.register !== 'function') {
+      noteBeacon('http-rpc-unavailable', 'connection.fetch.register unavailable')
+      return () => {}
+    }
     const handler = supervisorRpcHandler(ctx)
     const dispose = connection.fetch.register({
       path: '/api/dsh-supervisor/rpc',
@@ -5415,12 +5423,9 @@ function attachRpcHttp(ctx) {
       },
     })
     noteBeacon('http-rpc-registered', '/api/dsh-supervisor/rpc')
-    return () => {
-      Promise.resolve(dispose)
-        .then((off) => {
-          if (typeof off === 'function') off()
-        })
-        .catch(() => {})
+    return async () => {
+      const off = await Promise.resolve(dispose)
+      if (typeof off === 'function') await off()
     }
   } catch (err) {
     noteBeacon('http-rpc-register-failed', String((err && err.message) || err))
@@ -5688,11 +5693,18 @@ export function apply(ctx) {
     const unregisterInterrupt = attachInterrupt(ctx)
     const stopScheduler = startAutoReview(ctx)
     const stopLedger = startLedger(ctx)
-    const unregisterRpc = attachRpc(ctx)
-    // The /api carrier is the reachable one: webServer is not visible to a plugin
-    // context in this composition, so a webServer prefix route silently never mounts.
-    const unregisterRpcHttp = attachRpcHttp(ctx)
-    const unregisterBeacon = () => {}
+    // Register the browser route only while its connection service is present.
+    // Unlike a one-shot ctx.get(), inject reinstalls it if the service arrives late.
+    const routeContexts = new Set()
+    const routeFiber = ctx.inject(['connection'], (connectionCtx) => {
+      routeContexts.add(connectionCtx)
+      const unregisterRoute = attachRpcHttp(connectionCtx)
+      return async () => {
+        retiredStorageContexts.add(connectionCtx)
+        routeContexts.delete(connectionCtx)
+        await unregisterRoute()
+      }
+    })
     const unregister = ctx.tools.register(supervisorTool(ctx))
     void (async () => {
       try {
@@ -5706,7 +5718,9 @@ export function apply(ctx) {
         /* a settings migration must never block load */
       }
     })()
-    return () => {
+    return async () => {
+      retiredStorageContexts.add(ctx)
+      for (const connectionCtx of routeContexts) retiredStorageContexts.add(connectionCtx)
       try {
         unregisterCollector()
       } catch {
@@ -5727,33 +5741,16 @@ export function apply(ctx) {
       } catch {
         /* ignore */
       }
+      // Detach this generation's storage before awaiting any unrelated teardown.
+      const storageCleanup = closeStorage()
       try {
-        unregisterRpc()
-      } catch {
-        /* ignore */
-      }
-      try {
-        unregisterBeacon()
-      } catch {
-        /* ignore */
-      }
-      try {
-        unregisterRpcHttp()
-      } catch {
-        /* ignore */
+        if (routeFiber && typeof routeFiber.dispose === 'function') await routeFiber.dispose()
+      } catch (err) {
+        noteBeacon('http-rpc-dispose-failed', String((err && err.message) || err))
       }
       unregister()
       accumulators.clear()
-      const pending = domainPromise
-      domainPromise = undefined
-      if (pending) {
-        pending
-          .then(({ domain, settings }) => {
-            if (domain && typeof domain.close === 'function') domain.close()
-            if (settings && typeof settings.close === 'function') settings.close()
-          })
-          .catch(() => {})
-      }
+      await storageCleanup
     }
   }, 'dsh-supervisor: supervisor tool + evidence collector + storage domain')
 }

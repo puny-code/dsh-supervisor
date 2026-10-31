@@ -20,7 +20,7 @@
   var PANEL_ID = 'dsh-supervisor'
   var VIEW_ID = 'supervisor'
   var POLL_MS = 12000
-  var CLIENT_BUILD = 'v1.6.1'
+  var CLIENT_BUILD = 'v1.4.7'
 
   var React = null
   try {
@@ -118,7 +118,7 @@
       }
       return {
         ok: false,
-        error: { code: 'transport', message: failures.length ? failures.join(' · ') : '无法连接天监宿主', details: {} },
+        error: { code: 'transport', message: failures.length ? failures.filter(function (message, index) { return failures.indexOf(message) === index }).join(' · ') : '无法连接天监宿主', details: {} },
       }
     }
   }

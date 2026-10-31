@@ -1,6 +1,6 @@
 {
   "name": "dsh-supervisor",
-  "version": "1.4.6",
+  "version": "1.4.7",
   "description": "天监 — a supervisor surface for DeepSeek Harness: baseline, evidence, review and interfaces that keep long builds aligned.",
   "private": true,
   "type": "module",
