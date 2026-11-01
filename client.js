@@ -20,7 +20,7 @@
   var PANEL_ID = 'dsh-supervisor'
   var VIEW_ID = 'supervisor'
   var POLL_MS = 12000
-  var CLIENT_BUILD = 'v1.4.7'
+  var CLIENT_BUILD = 'v1.4.8'
 
   var React = null
   try {
@@ -3333,7 +3333,7 @@
                 'span',
                 { style: data.enabled === false ? TAB_UI.light : Object.assign({}, TAB_UI.light, TAB_UI.lightOn) },
                 React.createElement(Dot, { color: data.enabled === false ? T.idle : T.ok, size: 6 }),
-                data.enabled === false ? '已停用' : '监察中',
+                data.enabled === false ? (review || stage ? '已记录 · 未开启' : '已停用') : '监察中',
               )
             : null,
           data && data.reviewing

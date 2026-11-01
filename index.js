@@ -23,7 +23,7 @@ export const name = 'dsh-supervisor'
 export const inject = ['tools']
 
 /** Reported by `health` and the UI footer; keep in step with package.json. */
-const SUPERVISOR_VERSION = 'v1.4.7'
+const SUPERVISOR_VERSION = 'v1.4.8'
 
 // ---------------------------------------------------------------------------
 // Minimal structural validator (the only thing the storage domain needs from
@@ -135,6 +135,9 @@ const BASELINE = schema({
   decisions: F.arr(F.obj({ at: F.str(), text: F.str() }), () => []),
   createdAt: F.str(),
   updatedAt: F.str(),
+  // 'auto' means 天监 drafted it from the user's own words + requirement ledger;
+  // defaults keep baselines written before this field readable.
+  source: F.str('manual'),
 })
 
 const REVIEW = schema({
@@ -324,6 +327,7 @@ const VERDICT_TEXT = {
 
 const ACTIONS = [
   'status',
+  'baseline_draft',
   'baseline_set',
   'report',
   'review',
@@ -1472,7 +1476,7 @@ async function journalTrail(ctx, reviewId) {
 // ---------------------------------------------------------------------------
 
 async function actionStatus(ctx, exec) {
-  const { domain, error } = await storage(ctx)
+  const { domain, sessions: sessionsDomain, error } = await storage(ctx)
   const workspaceId = workspaceIdOf(ctx, exec)
   if (!domain) {
     return {
@@ -1491,7 +1495,8 @@ async function actionStatus(ctx, exec) {
     `天监 ${SUPERVISOR_VERSION} · 工作区 ${workspaceId}`,
     baseline
       ? `基线：第 ${baseline.revision} 版 · 意图「${baseline.intent || '未填写'}」· 目标 ${baseline.goals.length} 条 · 硬约束 ${baseline.constraints.hard.length} 条 · 软约束 ${baseline.constraints.soft.length} 条 · 方向 ${baseline.directions.length} 条`
-      : '基线：尚未建立（需用户批准后调用 baseline_set）',
+      : '基线：尚未建立 —— 可先调用 supervisor action=baseline_draft 看草稿，确认后用 action=baseline_set auto=true 让天监按用户原话与要求台账自动填写',
+    `本会话监察：${sessionPrefOf(sessionsDomain, sessionId).enabled ? '已开启' : '未开启（工具仍可调用；点胶囊或调 report 会自动开启）'}`,
     `本会话审查 ${counters.reviewCount} 次（严重 ${counters.criticalCount} · 连续偏移 ${counters.driftStreak}）`,
     `项目累计审查 ${totals.reviewCount} 次（严重 ${totals.criticalCount} · 最大连续偏移 ${totals.driftStreak}）`,
     `最近审查：${counters.lastReviewAt || totals.lastReviewAt || '无'}`,
@@ -1676,6 +1681,87 @@ async function actionDiag(ctx) {
   }
 }
 
+/**
+ * A session that never had a preference row is treated as "engaged by use":
+ * calling the supervisor is itself a request for supervision. An explicit
+ * disable writes a row, so it is never overridden here.
+ */
+async function markSessionEngaged(ctx, sessionId) {
+  if (!sessionId) return false
+  try {
+    const { sessions: sessionsDomain } = await storage(ctx)
+    if (!sessionsDomain) return false
+    if (sessionsDomain.table('prefs').get(String(sessionId))) return false
+    await sessionsDomain.table('prefs').put(
+      String(sessionId),
+      SESSION_PREF.parse({ enabled: true, viewedReviewId: '', updatedAt: now() }),
+    )
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Draft a baseline from what the user actually said plus the requirement
+ * ledger. It is a starting point a human confirms, so it never invents goals
+ * out of the assistant's own plan.
+ */
+function draftBaseline(ctx, { domain, workspaceId, sessionId }) {
+  let reqs = []
+  try {
+    reqs = activeRequirements(domain, workspaceId) || []
+  } catch {
+    reqs = []
+  }
+  const pick = (kind, strength) =>
+    reqs
+      .filter((r) => r && r.kind === kind && (!strength || r.strength === strength))
+      .map((r) => String(r.text || '').trim())
+      .filter(Boolean)
+      .slice(0, 12)
+  const acc = sessionId ? accumulators.get(sessionId) : null
+  const timeline = acc && Array.isArray(acc.userTimeline) ? acc.userTimeline : []
+  const firstAsk = timeline.length ? String(timeline[0].text || '') : ''
+  const goals = pick('goal')
+  return {
+    intent: (firstAsk || goals[0] || '').replace(/\s+/g, ' ').slice(0, 120),
+    goals,
+    constraints: { hard: pick('constraint', 'hard'), soft: pick('constraint', 'soft') },
+    directions: pick('direction'),
+    sources: { requirements: reqs.length, userMessages: timeline.length },
+  }
+}
+
+async function actionBaselineDraft(ctx, exec) {
+  const { domain, error } = await storage(ctx)
+  const workspaceId = workspaceIdOf(ctx, exec)
+  if (!domain) return { status: 'degraded', message: `天监：存储不可用（${error}）。`, data: { workspaceId } }
+  const sessionId = exec && exec.agent ? exec.agent.id : ''
+  const draft = draftBaseline(ctx, { domain, workspaceId, sessionId })
+  const total = draft.goals.length + draft.constraints.hard.length + draft.constraints.soft.length + draft.directions.length
+  if (!total && !draft.intent) {
+    return {
+      status: 'ok',
+      message: '天监：没有可用来起草基线的材料（用户原话与要求台账都是空的）。请先正常对话几句，或直接提供意图/目标。',
+      data: { workspaceId, draft },
+    }
+  }
+  return {
+    status: 'ok',
+    message: [
+      `天监：草稿（未保存）——依据 ${draft.sources.userMessages} 条用户原话、${draft.sources.requirements} 条台账`,
+      `意图：${draft.intent || '（空）'}`,
+      `目标：${draft.goals.length ? draft.goals.map((g) => `· ${g}`).join(' ') : '（空）'}`,
+      `硬约束：${draft.constraints.hard.length ? draft.constraints.hard.join('；') : '（空）'}`,
+      `软约束：${draft.constraints.soft.length ? draft.constraints.soft.join('；') : '（空）'}`,
+      `方向：${draft.directions.length ? draft.directions.join('；') : '（空）'}`,
+      '确认后调用 supervisor action=baseline_set auto=true 保存为项目基线。',
+    ].join('\n'),
+    data: { workspaceId, draft },
+  }
+}
+
 async function actionBaselineSet(ctx, exec, args) {
   const { domain, error } = await storage(ctx)
   const workspaceId = workspaceIdOf(ctx, exec)
@@ -1723,26 +1809,52 @@ async function actionBaselineSet(ctx, exec, args) {
   }
 
   const existing = domain.table('baselines').get(workspaceId)
+  // auto=true means "fill the gaps from what the user actually asked for".
+  // Explicit arguments always win; the draft only supplies what is missing.
+  const auto = Boolean(args && args.auto === true)
+  const draft = auto ? draftBaseline(ctx, { domain, workspaceId, sessionId }) : null
+  const fromDraft = (key) => (draft ? draft[key] : undefined)
+  const provided = (value) => Array.isArray(value) && value.filter((x) => typeof x === 'string').length > 0
+  const goals = pickArray(args.goals, draft && draft.goals.length ? draft.goals : existing ? existing.goals : [])
+  const hard = args.constraints && Array.isArray(args.constraints.hard) && provided(args.constraints.hard)
+    ? args.constraints.hard.filter((x) => typeof x === 'string')
+    : draft && draft.constraints.hard.length ? draft.constraints.hard : existing ? existing.constraints.hard : []
+  const soft = args.constraints && Array.isArray(args.constraints.soft) && provided(args.constraints.soft)
+    ? args.constraints.soft.filter((x) => typeof x === 'string')
+    : draft && draft.constraints.soft.length ? draft.constraints.soft : existing ? existing.constraints.soft : []
   const record = BASELINE.parse({
     workspaceId,
     revision: (existing ? existing.revision : 0) + 1,
-    intent: typeof args.intent === 'string' && args.intent.trim() ? args.intent.trim() : existing ? existing.intent : '',
-    goals: pickArray(args.goals, existing ? existing.goals : []),
-    constraints: {
-      hard: args.constraints && Array.isArray(args.constraints.hard) ? args.constraints.hard.filter((x) => typeof x === 'string') : existing ? existing.constraints.hard : [],
-      soft: args.constraints && Array.isArray(args.constraints.soft) ? args.constraints.soft.filter((x) => typeof x === 'string') : existing ? existing.constraints.soft : [],
-    },
-    directions: pickArray(args.directions, existing ? existing.directions : []),
+    intent:
+      typeof args.intent === 'string' && args.intent.trim()
+        ? args.intent.trim()
+        : draft && draft.intent
+          ? draft.intent
+          : existing
+            ? existing.intent
+            : '',
+    goals,
+    constraints: { hard, soft },
+    directions: pickArray(args.directions, draft && draft.directions.length ? draft.directions : existing ? existing.directions : []),
     decisions: existing ? existing.decisions : [],
     createdAt: existing ? existing.createdAt : stamp,
     updatedAt: stamp,
+    source: draft && !provided(args.goals) ? 'auto' : 'manual',
   })
   await domain.table('baselines').put(workspaceId, record)
-  await appendJournal(domain, 'baseline_updated', { workspaceId, revision: record.revision })
+  await appendJournal(domain, 'baseline_updated', {
+    workspaceId,
+    revision: record.revision,
+    source: record.source,
+    fromRequirements: draft ? draft.sources.requirements : 0,
+  })
+  await markSessionEngaged(ctx, sessionId)
   return {
     status: 'ok',
-    message: `天监：项目基线已保存为第 ${record.revision} 版（目标 ${record.goals.length} 条 · 硬约束 ${record.constraints.hard.length} 条 · 软约束 ${record.constraints.soft.length} 条 · 方向 ${record.directions.length} 条）。`,
-    data: { workspaceId, scope: 'project', baseline: record },
+    message:
+      `天监：项目基线已保存为第 ${record.revision} 版（目标 ${record.goals.length} 条 · 硬约束 ${record.constraints.hard.length} 条 · 软约束 ${record.constraints.soft.length} 条 · 方向 ${record.directions.length} 条）。` +
+      (record.source === 'auto' ? '\n（由天监根据用户原话与要求台账起草，请核对是否符合预期；不对可再调用一次覆盖。）' : ''),
+    data: { workspaceId, scope: 'project', baseline: record, draft },
   }
 }
 
@@ -1786,6 +1898,9 @@ async function actionReport(ctx, exec, args) {
     parentAgent: exec && exec.agent ? exec.agent : null,
     signal: exec && exec.signal ? exec.signal : undefined,
   })
+  // Using the supervisor is itself a request to be supervised: a session that
+  // never chose a preference becomes "engaged" instead of reading as idle.
+  await markSessionEngaged(ctx, sessionId)
 
   let reviewId
   if (outcome.ok) {
@@ -1902,6 +2017,7 @@ async function actionReview(ctx, exec) {
     parentAgent: exec && exec.agent ? exec.agent : null,
     signal: exec && exec.signal ? exec.signal : undefined,
   })
+  await markSessionEngaged(ctx, sessionId)
   if (!outcome.ok) {
     return {
       status: 'degraded',
@@ -2084,7 +2200,8 @@ async function actionChildRead(ctx, exec, args) {
   }
 }
 
-async function actionEvidence(ctx, exec) {
+async function actionEvidence(ctx, exec, args) {
+  const verbose = Boolean(args && args.verbose === true)
   const sessionId = exec && exec.agent ? exec.agent.id : ''
   const backfill = await backfillUserTimeline(ctx, sessionId)
   const evidence = evidenceOf(sessionId)
@@ -2113,10 +2230,10 @@ async function actionEvidence(ctx, exec) {
       `待办：${evidence.todos.length ? evidence.todos.map((t) => `${t.status}:${t.content.slice(0, 20)}`).join(' / ') : '无'}`,
       `目标：${evidence.goal ? `${evidence.goal.status} ${evidence.goal.objective.slice(0, 40)}` : '无'}`,
       `用户原话：${evidence.userTimeline.length ? `${evidence.userTimeline.length} 条（最近 U${evidence.userTimeline[evidence.userTimeline.length - 1].seq} ${String(evidence.userTimeline[evidence.userTimeline.length - 1].text).slice(0, 60)}）` : '无'}`,
-      `事件分布：${Object.entries(evidence.topEvents).map(([type, count]) => `${type}×${count}`).join(' ')}`,
-      `user/message 样本：${((accumulators.get(sessionId) || {}).userShapeSamples || []).join(' ||| ') || '未采集到'}`,
-      `事件记录键：${(accumulators.get(sessionId) || {}).eventShapeSample || '未采集到'}`,
-      `请求头样本：${evidence.headerRaw || '无'}`,
+      verbose
+        ? `事件分布：${Object.entries(evidence.topEvents).map(([type, count]) => `${type}×${count}`).join(' ')}`
+        : '',
+      verbose ? `请求头样本：${evidence.headerRaw || '无'}` : '',
       evidence.diffStat.files === 0
         ? '提示：文件级证据在回合结束时写入（workspace/changes 事件），本回合结束前为 0 是正常的。'
         : '',
@@ -5437,7 +5554,8 @@ const DESCRIPTION =
   '天监 (supervisor) — 本项目需求的监督者。施工方在每个阶段边界调用它：' +
   'report（提交阶段汇报，并由「观天」在干净上下文里做一次轻量审查、当场返回裁决与纠偏建议）、' +
   'review（对最近一个已记录阶段重跑一次审查）、evidence（查看当前阶段已采集的证据）、status（查看基线与审查计数）、' +
-  'baseline_set（经用户批准后登记或更新基线：意图/目标/硬约束/软约束/技术方向）、' +
+  'baseline_draft（只用只读方式起草基线：从用户原话与要求台账拼出意图/目标/约束，不保存）、' +
+  'baseline_set（登记或更新基线：意图/目标/硬约束/软约束/技术方向；auto=true 时缺省字段由天监按用户原话自动补齐）、' +
   'review_list（查看历史审查）、journal_tail（查看审计日志）、ack（清掉阻塞提醒）、settings（查看或修改审查配置：开关/引擎/模型/超时/阻断阈值/定时兜底/阈值打断）。' +
   '证据由插件自动采集（改动文件与行数、工具调用、错误、命令、待办、目标、用户请求），施工方无需整理。' +
   '审查分两档：轻审（单次调用）与深审（先找疑点、再对抗核验）；轻审判出偏移或阶段很大时可自动升级为深审。' +
@@ -5469,6 +5587,8 @@ function supervisorTool(ctx) {
           },
           description: 'baseline_set：项目约束。',
         },
+        auto: { type: 'boolean', description: 'baseline_set：按用户原话与要求台账自动起草缺失的基线字段（显式传入的字段优先）。' },
+        verbose: { type: 'boolean', description: 'evidence：附带调试明细（事件分布、请求头样本）；默认只给人话摘要。' },
         summary: { type: 'string', description: 'report：本阶段做了什么、为什么这么做。' },
         touched: { type: 'array', items: { type: 'string' }, description: 'report：本阶段新增或修改的文件路径。' },
         limit: { type: 'number', description: 'review_list / journal_tail：返回条数上限。' },
@@ -5531,6 +5651,8 @@ function supervisorTool(ctx) {
       switch (action) {
         case 'status':
           return actionStatus(ctx, exec)
+        case 'baseline_draft':
+          return actionBaselineDraft(ctx, exec)
         case 'baseline_set':
           return actionBaselineSet(ctx, exec, args)
         case 'report':
@@ -5540,7 +5662,7 @@ function supervisorTool(ctx) {
         case 'settings':
           return actionSettings(ctx, exec, args)
         case 'evidence':
-          return actionEvidence(ctx, exec)
+          return actionEvidence(ctx, exec, args)
         case 'review_list':
           return actionReviewList(ctx, exec, args)
         case 'journal_tail':
@@ -5779,4 +5901,6 @@ export const __internals = {
   countersOf,
   saveCounters,
   clearNotices,
+  draftBaseline,
+  markSessionEngaged,
 }
