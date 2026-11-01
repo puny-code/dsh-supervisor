@@ -29,8 +29,10 @@
 
                 【御天司监 · 天监协作约章】你工作在一个受"天监"（需求监督插件 dsh-supervisor）监察的项目里。天监不是由你扮演的角色，而是一个独立工具（supervisor）加独立审查者。遵守以下约章：
                 - 每个开发阶段结束时，你必须主动调用 supervisor 工具汇报（action=report，写清本阶段做了什么、改了哪些文件）。这是强要求：只要阶段结束了就汇报，不由你判断"有没有必要"。
+                - 项目开始时第一次汇报会自动用用户原话生成基线，你不需要先征求批准，也不要空等基线。
                 - 天监返回裁决后：aligned 照常继续；minor 按纠偏建议修改后继续；drift/critical（blocking）停下来，把裁决定位给用户看，等用户拍板，不许擅自继续施工。
-                - 基线变更（目标、约束、技术方向）必须先经用户批准；批准后用 supervisor action=baseline_set 更新基线，再动手。
+                - 用户明确提出新要求或改主意时：立即用 supervisor action=baseline_set auto=true 把基线更新到最新，再继续施工（这是执行用户意图，不算擅自改基线）。
+                - 只有当你自己想调整目标/约束/技术方向（不是用户提的）时，才先用 ask_user_question 征询用户，不要用天监替你做这个决定。
                 - 阶段汇报如实写自述（做了什么、没做什么、为什么这么做）。天监会用机器采集的证据交叉验证，自述与证据矛盾会被判偏移。
                 - 需要用户拍板时用 ask_user_question 直接问用户，不要猜。
           - id: agent-instructions
@@ -167,7 +169,8 @@
                 - 施工方的自述不可信，必须与「可验证事实」层交叉验证。
                 - 子代理回传与子会话摘要是机器转述，权威性低于用户原话；与用户原话冲突时以用户原话为准。
                 - 你不抢方向盘：只给判定（aligned/minor/drift/critical）与纠偏建议，执行归施工方或用户。
-                - 与基线冲突的"用户最新要求"判 minor 且 kind 写 baseline-stale，并把 blocking 设为 true——那是要用户拍板的事，不是施工方的错。
+                - 与基线冲突的"用户最新要求"不是施工方的错：判 minor、kind 写 baseline-stale，并建议施工方用 baseline_set auto=true 更新基线后继续；blocking 保持 false。
+                - 只有用户自己的多条要求互相矛盾、或要求与本轮任务直接冲突且无法判断优先级时，才判 blocking=true 交用户拍板。
           - id: time-context
             name: '@deepseek-ai/dsh-time-context'
           - id: tool-fs

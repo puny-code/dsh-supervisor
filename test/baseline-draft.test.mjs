@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { __internals } from '../index.js'
 
-const { draftBaseline, markSessionEngaged } = __internals
+const { draftBaseline, markSessionEngaged, ensureBaseline } = __internals
 
 function memTable() {
   const rows = new Map()
@@ -52,6 +52,33 @@ test('draftBaseline turns the requirement ledger into baseline fields', () => {
   assert.deepEqual(draft.directions, ['用 React.createElement'])
   assert.equal(draft.intent, '做出天监独立页')
   assert.equal(draft.sources.requirements, 4)
+})
+
+test('project start auto-creates the first baseline from the user request', async () => {
+  const facility = fakeFacility()
+  const domain = { table: (n) => facility.tables[n] || (facility.tables[n] = memTable()) }
+  facility.tables.requirements = memTable()
+  facility.tables.requirements.put('r1', { reqId: 'r1', workspaceId: 'ws', kind: 'goal', strength: 'hard', status: 'active', text: '做一个天监工作台' })
+  facility.tables.requirements.put('r2', { reqId: 'r2', workspaceId: 'ws', kind: 'constraint', strength: 'hard', status: 'active', text: '不要引入新依赖' })
+
+  const first = await ensureBaseline({}, { domain, workspaceId: 'ws', sessionId: '' })
+  assert.equal(first.created, true)
+  assert.equal(first.baseline.revision, 1)
+  assert.equal(first.baseline.source, 'auto')
+  assert.deepEqual(first.baseline.goals, ['做一个天监工作台'])
+
+  const second = await ensureBaseline({}, { domain, workspaceId: 'ws', sessionId: '' })
+  assert.equal(second.created, false)
+  assert.equal(second.baseline.revision, 1, 'existing baseline must not be rewritten')
+})
+
+test('no material means no baseline is invented', async () => {
+  const facility = fakeFacility()
+  const domain = { table: (n) => facility.tables[n] || (facility.tables[n] = memTable()) }
+  facility.tables.requirements = memTable()
+  const result = await ensureBaseline({}, { domain, workspaceId: 'empty-ws', sessionId: '' })
+  assert.equal(result.created, false)
+  assert.equal(result.baseline, null)
 })
 
 test('calling the supervisor engages a session that never chose a preference', async () => {

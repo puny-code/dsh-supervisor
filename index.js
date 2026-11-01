@@ -23,7 +23,7 @@ export const name = 'dsh-supervisor'
 export const inject = ['tools']
 
 /** Reported by `health` and the UI footer; keep in step with package.json. */
-const SUPERVISOR_VERSION = 'v1.4.8'
+const SUPERVISOR_VERSION = 'v1.4.9'
 
 // ---------------------------------------------------------------------------
 // Minimal structural validator (the only thing the storage domain needs from
@@ -1329,6 +1329,7 @@ function mergeBaselines(project, session) {
   const constraints = source.constraints || base.constraints || { hard: [], soft: [] }
   return {
     revision: base.revision || 0,
+    source: base.source || 'manual',
     sessionRevision: session ? session.revision : 0,
     scope: session && project ? 'project+session' : session ? 'session' : 'project',
     intent: pick('intent', ''),
@@ -1495,7 +1496,7 @@ async function actionStatus(ctx, exec) {
     `天监 ${SUPERVISOR_VERSION} · 工作区 ${workspaceId}`,
     baseline
       ? `基线：第 ${baseline.revision} 版 · 意图「${baseline.intent || '未填写'}」· 目标 ${baseline.goals.length} 条 · 硬约束 ${baseline.constraints.hard.length} 条 · 软约束 ${baseline.constraints.soft.length} 条 · 方向 ${baseline.directions.length} 条`
-      : '基线：尚未建立 —— 可先调用 supervisor action=baseline_draft 看草稿，确认后用 action=baseline_set auto=true 让天监按用户原话与要求台账自动填写',
+      : '基线：尚未建立 —— 下次 report/review 会自动收起用户原话生成第 1 版（也可立刻调 action=baseline_set auto=true）',
     `本会话监察：${sessionPrefOf(sessionsDomain, sessionId).enabled ? '已开启' : '未开启（工具仍可调用；点胶囊或调 report 会自动开启）'}`,
     `本会话审查 ${counters.reviewCount} 次（严重 ${counters.criticalCount} · 连续偏移 ${counters.driftStreak}）`,
     `项目累计审查 ${totals.reviewCount} 次（严重 ${totals.criticalCount} · 最大连续偏移 ${totals.driftStreak}）`,
@@ -1733,6 +1734,46 @@ function draftBaseline(ctx, { domain, workspaceId, sessionId }) {
   }
 }
 
+/**
+ * Project start is the one moment the user's own words ARE the baseline, so a
+ * missing baseline is filled automatically instead of blocking the review.
+ * Existing baselines are never touched here.
+ */
+async function ensureBaseline(ctx, { domain, workspaceId, sessionId }) {
+  if (!domain) return { created: false, baseline: null }
+  try {
+    const existing = domain.table('baselines').get(workspaceId)
+    if (existing) return { created: false, baseline: existing }
+    const draft = draftBaseline(ctx, { domain, workspaceId, sessionId })
+    const total = draft.goals.length + draft.constraints.hard.length + draft.constraints.soft.length + draft.directions.length
+    if (!total && !draft.intent) return { created: false, baseline: null }
+    const stamp = now()
+    const record = BASELINE.parse({
+      workspaceId,
+      revision: 1,
+      intent: draft.intent,
+      goals: draft.goals,
+      constraints: draft.constraints,
+      directions: draft.directions,
+      decisions: [],
+      createdAt: stamp,
+      updatedAt: stamp,
+      source: 'auto',
+    })
+    await domain.table('baselines').put(workspaceId, record)
+    await appendJournal(domain, 'baseline_auto_created', {
+      workspaceId,
+      sessionId,
+      goals: record.goals.length,
+      hard: record.constraints.hard.length,
+      fromRequirements: draft.sources.requirements,
+    })
+    return { created: true, baseline: record }
+  } catch {
+    return { created: false, baseline: null }
+  }
+}
+
 async function actionBaselineDraft(ctx, exec) {
   const { domain, error } = await storage(ctx)
   const workspaceId = workspaceIdOf(ctx, exec)
@@ -1880,7 +1921,9 @@ async function actionReport(ctx, exec, args) {
   const ledgerFlush = await flushLedger(ctx, { domain, settingsDomain, workspaceId, sessionId })
   const evidence = evidenceOf(sessionId)
   const sessionModel = sessionModelOf(ctx, sessionId) || (evidence && evidence.model) || null
-  const projectBaseline = domain.table('baselines').get(workspaceId) || null
+  // No human gate at project start: the user's opening request IS the baseline.
+  const ensured = await ensureBaseline(ctx, { domain, workspaceId, sessionId })
+  const projectBaseline = ensured.baseline
   const sessionBaseline = await sessionBaselineOf(ctx, sessionId)
   // 观天 reads the merge: project rules, narrowed by anything this session added.
   const baseline = mergeBaselines(projectBaseline, sessionBaseline)
@@ -2002,7 +2045,8 @@ async function actionReview(ctx, exec) {
   const last = reports.length ? reports[0][1] : null
   const evidence = last && last.evidence ? last.evidence : evidenceOf(sessionId)
   const stageSeq = last ? last.stageSeq : nextStageSeq(domain, workspaceId)
-  const baseline = domain.table('baselines').get(workspaceId) || null
+  const ensured = await ensureBaseline(ctx, { domain, workspaceId, sessionId })
+  const baseline = ensured.baseline
   const sessionModel = sessionModelOf(ctx, sessionId) || (evidence && evidence.model) || null
   const outcome = await runReview(ctx, {
     domain,
@@ -2451,7 +2495,7 @@ function renderBaseline(baseline) {
   }
   const decisions = (baseline.decisions || []).slice(-5).map((d) => `${d.at} ${d.text}`)
   return [
-    `## 基线（第 ${baseline.revision} 版，用户批准）`,
+    `## 基线（第 ${baseline.revision} 版，${baseline.source === 'auto' ? '天监按用户原话自动起草' : '手工登记'}）`,
     `意图：${baseline.intent || '（未填写）'}`,
     renderList('目标', baseline.goals, '  ').replace('目标：', '目标：').split('\n').join('\n'),
     renderList('硬约束（违反即 blocker）', baseline.constraints ? baseline.constraints.hard : [], '  '),
@@ -3051,12 +3095,13 @@ function startLedger(ctx) {
 
 const REVIEW_SYSTEM = [
   '你是「天监·观天」，一名独立的需求监督审查者。',
-  '你唯一要判断的是：施工方刚刚完成的这个阶段，是否偏离了用户批准的基线与用户本人提出的要求。你不评价代码风格好坏，也不替施工方设计实现。',
+  '你唯一要判断的是：施工方刚刚完成的这个阶段，是否偏离了用户提出的要求（基线就是这些要求的归纳，可能是天监自动起草的）。你不评价代码风格好坏，也不替施工方设计实现。',
   '',
   '审查规则：',
   '1. 权威顺序：**用户最新明确要求 > 基线 > 施工方自述**。',
-  '   基线是用户批准的长期约束；但用户随时可能改主意。当"用户原话"里出现了比基线更新的明确要求时，以用户原话为准。',
-  '1b. 若用户的最新要求与基线冲突：不要直接判 drift。判 minor 且 findings 的 kind 写 "baseline-stale"，detail 说明"用户已改要求，基线第 N 版需要更新"，并把 blocking 设为 true —— 这是要用户拍板的事，不是施工方的错。',
+  '   基线是用户原始要求的归纳；用户随时可能改主意。当"用户原话"里出现了比基线更新的明确要求时，以用户原话为准。',
+  '1b. 若用户的最新要求与基线冲突：这不叫偏移，也不该打断施工。判 minor，findings 的 kind 写 "baseline-stale"，detail 写"用户已改要求，基线第 N 版需更新为：<新要求>"，并在 suggestion 里明确让施工方调用 supervisor action=baseline_set auto=true 更新基线后继续。blocking 保持 false。',
+  '1b-2. 只有一种情况判 blocking=true 并要用户拍板：用户自己的多条要求之间互相矛盾、或用户要求与本轮任务目标直接冲突且无法从上下文判断哪条优先。',
   '1c. 「子代理回传」与「子会话摘要」是机器转述（子会话/队友的结论），权威性低于用户原话：与用户原话冲突时以用户原话为准；只能用它们补全事实链，不能单独据此判 drift。引用时用 R<序号> 锚点（如 R9120）。',
   '2. 只依据给出的证据与汇报下判断，不臆测未提供的信息；证据不足时写进 findings 并降低结论强度。',
   '2b. 若证据采集窗口明显短于阶段本身（例如插件刚重载），自述提到窗口外的改动属于正常，不要因此判定「证据与自述矛盾」。',
@@ -3312,7 +3357,7 @@ function verdictMessage(review, stageSeq) {
 
 const DEEP_ANALYSIS_SYSTEM = [
   '你是「观天·细读」，需求监督流程的第一道分析环节。',
-  '你会收到一份审查简报：用户批准的基线（意图 / 目标 / 硬约束 / 软约束 / 技术方向）、本阶段机器采集的证据、以及施工方的自述。',
+  '你会收到一份审查简报：基线（意图 / 目标 / 硬约束 / 软约束 / 技术方向，通常由天监从用户原话自动归纳）、本阶段机器采集的证据、以及施工方的自述。',
   '你的任务不是下最终结论，而是找出**值得怀疑的点**：范围扩大、用户可见行为改变、约束被违反、技术方向漂移、证据与自述不符、明显未完成却宣称完成。',
   '要求：',
   '1. 每条疑点都要指出依据来自简报的哪一段（basis 字段）。',
@@ -5555,7 +5600,8 @@ const DESCRIPTION =
   'report（提交阶段汇报，并由「观天」在干净上下文里做一次轻量审查、当场返回裁决与纠偏建议）、' +
   'review（对最近一个已记录阶段重跑一次审查）、evidence（查看当前阶段已采集的证据）、status（查看基线与审查计数）、' +
   'baseline_draft（只用只读方式起草基线：从用户原话与要求台账拼出意图/目标/约束，不保存）、' +
-  'baseline_set（登记或更新基线：意图/目标/硬约束/软约束/技术方向；auto=true 时缺省字段由天监按用户原话自动补齐）、' +
+  'baseline_set（登记或更新基线：意图/目标/硬约束/软约束/技术方向；auto=true 时缺省字段由天监按用户原话自动补齐；' +
+  '基线通常在首次 report 时自动建立，用户改主意后也用它更新，不需要额外征求批准）、' +
   'review_list（查看历史审查）、journal_tail（查看审计日志）、ack（清掉阻塞提醒）、settings（查看或修改审查配置：开关/引擎/模型/超时/阻断阈值/定时兜底/阈值打断）。' +
   '证据由插件自动采集（改动文件与行数、工具调用、错误、命令、待办、目标、用户请求），施工方无需整理。' +
   '审查分两档：轻审（单次调用）与深审（先找疑点、再对抗核验）；轻审判出偏移或阶段很大时可自动升级为深审。' +
@@ -5903,4 +5949,5 @@ export const __internals = {
   clearNotices,
   draftBaseline,
   markSessionEngaged,
+  ensureBaseline,
 }

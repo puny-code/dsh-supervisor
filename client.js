@@ -20,7 +20,7 @@
   var PANEL_ID = 'dsh-supervisor'
   var VIEW_ID = 'supervisor'
   var POLL_MS = 12000
-  var CLIENT_BUILD = 'v1.4.8'
+  var CLIENT_BUILD = 'v1.4.9'
 
   var React = null
   try {
